@@ -1,22 +1,16 @@
 import UIKit
 
-protocol ReviewsViewModelDelegate: AnyObject {
-    func didTapOnCell(with photoUrl: String)
-}
 /// Класс, описывающий бизнес-логику экрана отзывов.
 final class ReviewsViewModel: NSObject {
 
     /// Замыкание, вызываемое при изменении `state`.
     var onStateChange: ((State) -> Void)?
+    var didImageTapped: ((UIImage) -> Void)?
 
-    weak var delegate: ReviewsViewModelDelegate?
-    
     private var state: State
     private let reviewsProvider: ReviewsProvider
     private let ratingRenderer: RatingRenderer
     private let decoder: JSONDecoder
-    
-    
 
     init(
         state: State = State(),
@@ -42,14 +36,45 @@ extension ReviewsViewModel {
     func getReviews() {
         guard state.shouldLoad else { return }
         state.shouldLoad = false
-        reviewsProvider.getReviews(offset: state.offset, completion: gotReviews)
-    }
-    ///  Метод для обновления данных
-    func refreshData() {
-        state.items.removeAll()
-        state.offset = 0
-        state.shouldLoad = true
-        getReviews()
+
+        if state.items.isEmpty {
+            state.isLoading = true
+            onStateChange?(state)
+        }
+
+        Task { [weak self] in
+            guard let self = self else { return }
+            do {
+                let data = try await reviewsProvider.getReviews()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let reviews = try decoder.decode(Reviews.self, from: data)
+                let prefixCount = state.limit
+                var newItems = [ReviewItem]()
+                for review in reviews.items.prefix(prefixCount) {
+                    let item = try await makeReviewItem(review)
+                    newItems.append(item)
+                }
+                state.items += newItems
+
+                await MainActor.run { [weak self] in
+                    guard let self = self else { return }
+                    state.offset = state.items.count
+                    let remainingReviewsCount = reviews.count - state.offset
+                    state.limit = min(remainingReviewsCount, state.limit)
+                    state.shouldLoad = state.offset < reviews.count
+                    state.isLoading = false
+                    onStateChange?(state)
+                }
+            } catch {
+                print("Ошибка получения отзывов: \(error)")
+                await MainActor.run { [weak self] in
+                    guard let self = self else { return }
+                    state.shouldLoad = true
+                    state.isLoading = false
+                    onStateChange?(state)
+                }
+            }
+        }
     }
 
 }
@@ -57,21 +82,6 @@ extension ReviewsViewModel {
 // MARK: - Private
 
 private extension ReviewsViewModel {
-
-    /// Метод обработки получения отзывов.
-    func gotReviews(_ result: ReviewsProvider.GetReviewsResult) {
-        do {
-            let data = try result.get()
-            let reviews = try decoder.decode(Reviews.self, from: data)
-            state.items += reviews.items.map(makeReviewItem)
-            state.totalItemsCount = reviews.count
-            state.offset += state.limit
-            state.shouldLoad = state.offset < reviews.count
-        } catch {
-            state.shouldLoad = true
-        }
-            onStateChange?(state)
-    }
 
     /// Метод, вызываемый при нажатии на кнопку "Показать полностью...".
     /// Снимает ограничение на количество строк текста отзыва (раскрывает текст).
@@ -84,7 +94,33 @@ private extension ReviewsViewModel {
         state.items[index] = item
         onStateChange?(state)
     }
-    
+
+    func downloadImage(from url: URL) async throws -> UIImage  {
+        let key = url.absoluteString as NSString
+        if let cachedImage = ImageCache.shared.object(forKey: key) {
+            return cachedImage
+        }
+        let (data, _) = try await URLSession.shared.data(from: url)
+        guard let image = UIImage(data: data) else { throw NetworkErrors.decodingFailed }
+        ImageCache.shared.setObject(image, forKey: key)
+        return image
+    }
+
+    func fetchImages(photoUrls: [URL]) async throws -> [UIImage] {
+        let result = try await withThrowingTaskGroup(of: UIImage.self, returning: [UIImage].self) { taskGroup in
+            for url in photoUrls {
+                taskGroup.addTask {
+                    try await self.downloadImage(from: url)
+                }
+            }
+            var images = [UIImage]()
+            for try await image in taskGroup {
+                images.append(image)
+            }
+            return images
+        }
+        return result
+    }
 
 }
 
@@ -94,19 +130,23 @@ private extension ReviewsViewModel {
 
     typealias ReviewItem = ReviewCellConfig
 
-    func makeReviewItem(_ review: Review) -> ReviewItem {
+    func makeReviewItem(_ review: Review) async throws -> ReviewItem {
+        let fullNameString = "\(review.firstName) \(review.lastName)"
+        let urls = review.photoUrls.compactMap { URL(string: $0) }
+        guard let avatarUrl = URL(string: review.avatarUrl) else {
+            throw NetworkErrors.invalidURL
+        }
+        let avatarPhoto = try await downloadImage(from: avatarUrl)
+        let photosImages = try await fetchImages(photoUrls: urls)
+        let fullName = fullNameString.attributed(font: .username, color: .label)
         let reviewText = review.text.attributed(font: .text)
         let created = review.created.attributed(font: .created, color: .created)
-        let avatar = review.avatar
-        let rating = review.rating
-        let photosURL = review.photosURL?.map { $0.url }
-        let fullName = review.fullName.attributed(font: .username)
         let item = ReviewItem(
-            reviewText: reviewText,
-            rating: rating,
-            avatar: avatar,
             fullName: fullName,
-            photos: photosURL,
+            rating: review.rating,
+            avatar: avatarPhoto,
+            photos: photosImages,
+            reviewText: reviewText,
             created: created,
             onTapShowMore: showMoreReview
         )
@@ -125,15 +165,9 @@ extension ReviewsViewModel: UITableViewDataSource {
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let config = state.items[indexPath.row]
-        let cell = tableView.dequeueReusableCell(withIdentifier: config.reuseId, for: indexPath) as! ReviewCell
-        cell.delegate = self
+        let cell = tableView.dequeueReusableCell(withIdentifier: config.reuseId, for: indexPath)
+        config.update(cell: cell)
         return cell
-    }
-    
-    func tableView(_ tableView: UITableView, viewForFooterInSection section: Int) -> UIView? {
-        let footerView = ReviewFooterView(frame: CGRect(x: 0, y: 0, width: tableView.frame.width, height: 40))
-        footerView.configure(with: state.totalItemsCount ?? 0)
-        return footerView
     }
 
 }
@@ -145,10 +179,10 @@ extension ReviewsViewModel: UITableViewDelegate {
     func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat {
         state.items[indexPath.row].height(with: tableView.bounds.size)
     }
-    
+
     func tableView(_ tableView: UITableView, willDisplay cell: UITableViewCell, forRowAt indexPath: IndexPath) {
-        let config = state.items[indexPath.row]
-        config.update(cell: cell)
+        guard let reviewCell = cell as? ReviewCell else { return }
+        reviewCell.delegate = self
     }
 
     /// Метод дозапрашивает отзывы, если до конца списка отзывов осталось два с половиной экрана по высоте.
@@ -176,16 +210,12 @@ extension ReviewsViewModel: UITableViewDelegate {
 
 }
 
-//MARK: - ReviewCellDelegate
+// MARK: - ReviewCellDelegate
 
 extension ReviewsViewModel: ReviewCellDelegate {
-    func didTapShowMore(for rewiewId: UUID) {
-        showMoreReview(with: rewiewId)
+
+    func imageTapped(image: UIImage) {
+        didImageTapped?(image)
     }
-    
-    func collectionView(collectionviewcell: PhotoCell?, index: Int, didTappedInTableViewCell: ReviewCell) {
-        if let photoUrl = didTappedInTableViewCell.selectedPhotoUrl {
-            delegate?.didTapOnCell(with: photoUrl)
-        }
-    }
+
 }

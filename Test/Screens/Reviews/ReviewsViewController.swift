@@ -3,8 +3,6 @@ import UIKit
 final class ReviewsViewController: UIViewController {
 
     private lazy var reviewsView = makeReviewsView()
-    private let refreshControl = UIRefreshControl()
-    private var customSpinner = CustomSpinner()
     private let viewModel: ReviewsViewModel
 
     init(viewModel: ReviewsViewModel) {
@@ -23,57 +21,51 @@ final class ReviewsViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        setupViewModel()
-        viewModel.getReviews()
-        configureRefreshControl()
-        configureCustomSpinner()
-        viewModel.delegate = self
+        setupBindings()
+        fetchData()
     }
 }
 
-// MARK: - Private
+// MARK: - Private Methods
 
 private extension ReviewsViewController {
+    
+    func setupBindings() {
+        setupViewModelBindings()
+    }
+    
+    func fetchData() {
+        viewModel.getReviews()
+        RatingRenderer.shared.preloadCache()
+    }
 
+    func setupViewModelBindings() {
+        viewModel.onStateChange = { [weak self] state in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.reviewsView.tableView.reloadData()
+                self.reviewsView.updateCountOfReviews(state.items.count)
+                self.reviewsView.setLoading(state.isLoading)
+            }
+        }
+    }
+    
+   
+    
     func makeReviewsView() -> ReviewsView {
         let reviewsView = ReviewsView()
         reviewsView.tableView.delegate = viewModel
         reviewsView.tableView.dataSource = viewModel
+        reviewsView.delegate = self
         return reviewsView
-    }
-
-    func setupViewModel() {
-        viewModel.onStateChange = { [weak reviewsView, unowned self] _ in
-            reviewsView?.tableView.reloadData()
-            customSpinner.stopAnimation()
-        }
-    }
-
-    func configureRefreshControl() {
-        reviewsView.tableView.refreshControl = refreshControl
-        refreshControl.addTarget(self, action: #selector(refreshControlUsed), for: .valueChanged)
-    }
-    
-    func configureCustomSpinner() {
-        customSpinner = CustomSpinner(squareLength: 50)
-        reviewsView.addSubview(customSpinner)
-        customSpinner.startAnimation(delay: 0.04, replicates: 20)
-    }
-
-    @objc func refreshControlUsed() {
-        viewModel.refreshData()
-        reviewsView.tableView.reloadData()
-        refreshControl.endRefreshing()
     }
 }
 
-extension ReviewsViewController: ReviewsViewModelDelegate {
-    func didTapOnCell(with photoUrl: String) {
-        let vc = PhotoViewController()
-        vc.photoUrl = photoUrl
-        navigationController?.pushViewController(vc, animated: true)
-        
+// MARK: - ReviewsViewDelegate
+
+extension ReviewsViewController: ReviewsViewDelegate {
+    
+    func didUseRefreshControl() {
+        viewModel.getReviews()
     }
-    
-    
 }
